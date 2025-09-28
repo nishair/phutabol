@@ -74,15 +74,51 @@ print(f"Away Win: {prediction.away_win_probability:.1%}")
 
 ### Run the API Server
 
+#### Option 1: Direct Python Module (Recommended)
 ```bash
-# Start the API server
+cd phutabol
 python -m phutabol.api.main
-
-# Or run the example script
-python example_usage.py
 ```
 
-Visit `http://localhost:8000/docs` for interactive API documentation.
+#### Option 2: Using the Example Script
+```bash
+python example_usage.py
+# Then choose option 2 when prompted
+```
+
+#### Option 3: Using Uvicorn Directly
+```bash
+uvicorn phutabol.api.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+#### After Starting the API:
+
+- **API Base URL**: `http://localhost:8000`
+- **Interactive Documentation**: `http://localhost:8000/docs` (Swagger UI)
+- **Alternative Docs**: `http://localhost:8000/redoc`
+
+#### Quick API Test:
+```bash
+# Health check
+curl http://localhost:8000/health
+
+# Get teams
+curl http://localhost:8000/teams/Premier%20League
+
+# Quick prediction
+curl "http://localhost:8000/predict/team_1/vs/team_2?league=Premier%20League"
+
+# Available models
+curl http://localhost:8000/models
+```
+
+#### Troubleshooting:
+If you get import errors, ensure you're in the project root directory:
+```bash
+cd phutabol
+pip install -r requirements.txt
+python -m phutabol.api.main
+```
 
 ### Run Examples
 
