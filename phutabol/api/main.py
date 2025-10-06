@@ -5,6 +5,8 @@ from datetime import datetime, timedelta
 import asyncio
 
 from ..data.collector import DataCollector, MockDataSource
+from ..data.live_sources import FootballDataOrgSource, LiveDataCollector
+from ..config import get_config, DataSourceType
 from ..analysis.performance import PerformanceAnalyzer
 from ..analysis.context import ContextAnalyzer
 from ..prediction.models import (
@@ -35,9 +37,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global instances (in production, use dependency injection)
-data_source = MockDataSource()
-data_collector = DataCollector(data_source)
+# Global configuration and instances
+app_config = get_config()
+
+# Initialize data source based on configuration
+def create_data_source():
+    """Create appropriate data source based on configuration."""
+    if app_config.data_source_type == DataSourceType.FOOTBALL_DATA_ORG:
+        if app_config.api_config.football_data_api_key:
+            return FootballDataOrgSource(app_config.api_config.football_data_api_key)
+        else:
+            print("⚠️  Football-Data.org API key not found, falling back to mock data")
+            return MockDataSource()
+    elif app_config.data_source_type == DataSourceType.MIXED:
+        # Use live data collector with fallbacks
+        primary_source = FootballDataOrgSource(app_config.api_config.football_data_api_key)
+        return LiveDataCollector(primary_source, [MockDataSource()])
+    else:
+        return MockDataSource()
+
+# Global instances
+data_source = create_data_source()
+if isinstance(data_source, LiveDataCollector):
+    data_collector = data_source
+else:
+    data_collector = DataCollector(data_source)
 performance_analyzer = PerformanceAnalyzer()
 context_analyzer = ContextAnalyzer()
 
@@ -62,7 +86,26 @@ async def root():
         "message": "Phutabol Soccer Prediction API",
         "version": "1.0.0",
         "available_models": list(models.keys()),
+        "data_source": app_config.data_source_type.value,
+        "live_data_available": app_config.has_live_data_access(),
+        "supported_leagues": list(app_config.supported_leagues.keys()),
         "status": "healthy"
+    }
+
+
+@app.get("/config")
+async def get_configuration():
+    """Get current configuration and setup instructions."""
+    return {
+        "data_source_type": app_config.data_source_type.value,
+        "live_data_available": app_config.has_live_data_access(),
+        "supported_leagues": app_config.supported_leagues,
+        "default_model": app_config.default_prediction_model,
+        "features": {
+            "context_analysis": app_config.enable_context_analysis,
+            "form_analysis": app_config.enable_form_analysis
+        },
+        "setup_instructions": app_config.get_setup_instructions()
     }
 
 
@@ -70,7 +113,18 @@ async def root():
 async def get_teams(league: str):
     """Get all teams in a specific league."""
     try:
-        teams = await data_source.get_teams(league)
+        # Check if using live data collector
+        if isinstance(data_collector, LiveDataCollector):
+            current_data = await data_collector.get_current_season_data(league)
+            teams = current_data["teams"]
+        else:
+            # Use traditional data source
+            if hasattr(data_source, '__aenter__'):
+                async with data_source as source:
+                    teams = await source.get_teams(league)
+            else:
+                teams = await data_source.get_teams(league)
+
         return [TeamResponse.from_team(team) for team in teams]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -132,15 +186,109 @@ async def get_matches(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/fixtures/{league}")
+async def get_upcoming_fixtures(
+    league: str,
+    days_ahead: int = Query(7, description="Number of days to look ahead")
+):
+    """Get upcoming fixtures for a league."""
+    try:
+        if isinstance(data_collector, LiveDataCollector):
+            current_data = await data_collector.get_current_season_data(league)
+            fixtures = current_data.get("upcoming_fixtures", [])
+
+            # Filter by days ahead
+            end_date = datetime.now() + timedelta(days=days_ahead)
+            filtered_fixtures = [
+                f for f in fixtures
+                if f.scheduled_datetime and f.scheduled_datetime <= end_date
+            ]
+
+            return [MatchResponse.from_match(match) for match in filtered_fixtures]
+        else:
+            # For mock data, generate some upcoming fixtures
+            end_date = datetime.now() + timedelta(days=days_ahead)
+            start_date = datetime.now()
+
+            if hasattr(data_source, '__aenter__'):
+                async with data_source as source:
+                    matches = await source.get_matches(league, start_date, end_date)
+            else:
+                matches = await data_source.get_matches(league, start_date, end_date)
+
+            return [MatchResponse.from_match(match) for match in matches]
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/live/{league}")
+async def get_live_data_summary(league: str):
+    """Get a summary of live data for a league."""
+    try:
+        if isinstance(data_collector, LiveDataCollector):
+            current_data = await data_collector.get_current_season_data(league)
+
+            return {
+                "league": league,
+                "total_teams": len(current_data["teams"]),
+                "recent_matches": len(current_data["recent_matches"]),
+                "upcoming_fixtures": len(current_data.get("upcoming_fixtures", [])),
+                "last_updated": current_data["last_updated"],
+                "data_source": current_data["source"],
+                "cache_status": "cached" if data_collector._is_cache_valid(f"{league}_current_season") else "fresh"
+            }
+        else:
+            return {
+                "league": league,
+                "message": "Using mock data - set up live data sources for real-time information",
+                "data_source": "mock"
+            }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/predict", response_model=PredictionResponse)
 async def predict_match(request: PredictionRequest):
     """Predict the outcome of a match."""
     try:
-        # Get teams data
+        # Get teams data with live data support
+        if isinstance(data_collector, LiveDataCollector):
+            current_data = await data_collector.get_current_season_data(request.league)
+            teams = current_data["teams"]
+            matches = current_data["recent_matches"]
+            team_forms = current_data["team_forms"]
+        else:
+            # Use traditional data source
+            if hasattr(data_source, '__aenter__'):
+                async with data_source as source:
+                    teams = await source.get_teams(request.league)
+            else:
+                teams = await data_source.get_teams(request.league)
+
+            # Get recent matches for context
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=90)
+
+            if hasattr(data_source, '__aenter__'):
+                async with data_source as source:
+                    matches = await source.get_matches(request.league, start_date, end_date)
+            else:
+                matches = await data_source.get_matches(request.league, start_date, end_date)
+
+            # Get team forms
+            team_forms = {}
+            for team in teams:
+                if hasattr(data_source, '__aenter__'):
+                    async with data_source as source:
+                        team_forms[team.id] = await source.get_team_form(team.id)
+                else:
+                    team_forms[team.id] = await data_source.get_team_form(team.id)
+
+        # Find the teams
         home_team = None
         away_team = None
-        teams = await data_source.get_teams(request.league)
-
         for team in teams:
             if team.id == request.home_team_id:
                 home_team = team
@@ -153,14 +301,9 @@ async def predict_match(request: PredictionRequest):
                 detail="One or both teams not found in the specified league"
             )
 
-        # Get recent matches for context
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=90)
-        matches = await data_source.get_matches(request.league, start_date, end_date)
-
-        # Get team forms
-        home_form = await data_source.get_team_form(home_team.id)
-        away_form = await data_source.get_team_form(away_team.id)
+        # Get team forms from the data we already collected
+        home_form = team_forms.get(home_team.id)
+        away_form = team_forms.get(away_team.id)
 
         # Calculate performance metrics
         home_metrics = performance_analyzer.calculate_team_metrics(
@@ -208,13 +351,12 @@ async def predict_match(request: PredictionRequest):
         # Add team comparison
         team_comparison = performance_analyzer.compare_teams(home_metrics, away_metrics)
 
-        return PredictionResponse(
+        return PredictionResponse.from_prediction_and_teams(
             prediction=prediction,
-            home_team=TeamResponse.from_team(home_team),
-            away_team=TeamResponse.from_team(away_team),
+            home_team=home_team,
+            away_team=away_team,
             team_comparison=team_comparison,
-            model_used=model_name,
-            confidence_score=prediction.model_confidence
+            model_name=model_name
         )
 
     except HTTPException:

@@ -178,14 +178,6 @@ class PredictionResponse(BaseModel):
             factors_considered=prediction.factors_considered
         )
 
-    # Update the existing from_prediction method
-    prediction: MatchPrediction
-    home_team: TeamResponse
-    away_team: TeamResponse
-    team_comparison: Dict[str, float]
-    model_used: str
-    confidence_score: float
-
 
 class PredictionRequest(BaseModel):
     """Request model for match predictions."""

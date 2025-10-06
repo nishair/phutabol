@@ -112,6 +112,63 @@ curl "http://localhost:8000/predict/team_1/vs/team_2?league=Premier%20League"
 curl http://localhost:8000/models
 ```
 
+#### What You'll See After Starting:
+```
+INFO:     Started server process [12345]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+```
+
+#### Next Steps - What You Can Do:
+
+**1. Open Interactive Documentation (Recommended First Step)**
+```
+http://localhost:8000/docs
+```
+This gives you a **Swagger UI** where you can:
+- See all available endpoints
+- Test API calls directly in the browser
+- View request/response schemas
+- Try predictions without writing code
+
+**2. Test Basic Endpoints**
+```
+# Health Check
+http://localhost:8000/health
+
+# Get Available Models
+http://localhost:8000/models
+
+# Get Teams
+http://localhost:8000/teams/Premier%20League
+```
+
+**3. Make Your First Prediction**
+```
+http://localhost:8000/predict/team_1/vs/team_2?league=Premier%20League&model=ensemble
+```
+
+**4. Use Interactive Docs for POST Requests**
+1. Go to `http://localhost:8000/docs`
+2. Click on **"POST /predict"**
+3. Click **"Try it out"**
+4. Use this sample request:
+```json
+{
+  "home_team_id": "team_1",
+  "away_team_id": "team_2",
+  "league": "Premier League",
+  "model": "ensemble"
+}
+```
+5. Click **"Execute"**
+
+**5. Stop the Server**
+Press **Ctrl+C** in the terminal when done.
+
+> 💡 **Note**: The API comes with mock data, so you can immediately test all features!
+
 #### Troubleshooting:
 If you get import errors, ensure you're in the project root directory:
 ```bash
@@ -123,7 +180,50 @@ python -m phutabol.api.main
 ### Run Examples
 
 ```bash
+# Basic examples with mock data
 python example_usage.py
+
+# Live data examples (requires API key)
+python live_example.py
+```
+
+## 🚀 **NEW: Live Data Integration**
+
+### Setup Real-Time Data Sources
+
+#### Option 1: Football-Data.org (Free - Recommended)
+1. **Get API Key**: Visit [Football-Data.org](https://www.football-data.org/client/register)
+2. **Set Environment Variables**:
+   ```bash
+   export FOOTBALL_DATA_API_KEY="your_api_key_here"
+   export PHUTABOL_DATA_SOURCE="football_data_org"
+   ```
+3. **Restart API**: `python -m phutabol.api.main`
+
+#### Option 2: RapidAPI Football (Premium Features)
+1. **Get API Key**: Visit [RapidAPI Football](https://rapidapi.com/api-sports/api/api-football)
+2. **Set Environment Variables**:
+   ```bash
+   export RAPIDAPI_KEY="your_api_key_here"
+   export PHUTABOL_DATA_SOURCE="rapidapi"
+   ```
+
+#### Live Data Features:
+- ✅ **Current 2024-25 season statistics**
+- ✅ **Real team standings and Elo ratings**
+- ✅ **Actual match results and fixtures**
+- ✅ **Team form based on recent games**
+- ✅ **Live injury and suspension data** (RapidAPI)
+- ✅ **Weather and venue information**
+- ✅ **15-minute intelligent caching**
+
+#### Check Configuration:
+```bash
+# View current setup
+curl http://localhost:8000/config
+
+# Test live data access
+curl http://localhost:8000/live/Premier%20League
 ```
 
 ## API Endpoints
@@ -138,9 +238,12 @@ python example_usage.py
 - `GET /teams/{league}` - Get teams in a league
 - `GET /teams/{league}/standings` - League standings
 - `GET /matches/{league}` - Get matches
+- `GET /fixtures/{league}` - Get upcoming fixtures
+- `GET /live/{league}` - Live data summary
 
-### Model Information
+### Configuration & Status
 
+- `GET /config` - Current configuration and setup instructions
 - `GET /models` - Available prediction models
 - `GET /health` - API health check
 
