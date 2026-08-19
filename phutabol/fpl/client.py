@@ -7,7 +7,7 @@ The FPL API is free and requires no authentication. Endpoints used:
 """
 
 import requests
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 
 
 class FPLClient:
@@ -41,6 +41,33 @@ class FPLClient:
             response.raise_for_status()
             self._fixtures = response.json()
         return self._fixtures
+
+    def _get_json(self, path: str) -> Optional[Any]:
+        response = self.session.get(
+            f"{self.BASE_URL}/{path}", timeout=self.timeout
+        )
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return response.json()
+
+    def get_entry(self, team_id: int) -> Optional[Dict[str, Any]]:
+        """Public metadata for a manager's team; None if it doesn't exist."""
+        return self._get_json(f"entry/{team_id}/")
+
+    def get_entry_history(self, team_id: int) -> Optional[Dict[str, Any]]:
+        """Season history and chips played."""
+        return self._get_json(f"entry/{team_id}/history/")
+
+    def get_entry_picks(
+        self, team_id: int, event: int
+    ) -> Optional[Dict[str, Any]]:
+        """Picks for a gameweek (public once its deadline has passed)."""
+        return self._get_json(f"entry/{team_id}/event/{event}/picks/")
+
+    def get_entry_transfers(self, team_id: int) -> List[Dict[str, Any]]:
+        """Full transfer ledger for a team."""
+        return self._get_json(f"entry/{team_id}/transfers/") or []
 
     def get_next_event(self) -> Dict[str, Any]:
         """Return the next (or current) gameweek."""

@@ -54,6 +54,11 @@ class ProjectedPlayer:
     selected_by_percent: float
     status: str
     news: str
+    # Components of projected_ppg, for callers that need per-gameweek
+    # granularity: projected_ppg = base_ppg * availability * fixture
+    # factor over the build horizon.
+    base_ppg: float = 0.0
+    availability: float = 1.0
 
     @property
     def position_name(self) -> str:
@@ -170,10 +175,13 @@ def build_projections(
         baseline = POSITION_BASELINE_PPG[position]
         shrunk_ppg = reliability * last_ppg + (1 - reliability) * baseline
 
-        projected = (
+        base_ppg = (
             shrunk_ppg
             * _luck_adjustment(element, position)
             * _age_adjustment(element, position, as_of)
+        )
+        projected = (
+            base_ppg
             * availability
             * fixture_factors.get(element["team"], 1.0)
         )
@@ -193,6 +201,8 @@ def build_projections(
                 selected_by_percent=float(element["selected_by_percent"]),
                 status=element["status"],
                 news=element.get("news", ""),
+                base_ppg=round(base_ppg, 3),
+                availability=availability,
             )
         )
 
