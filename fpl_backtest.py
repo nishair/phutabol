@@ -24,7 +24,7 @@ import argparse
 import io
 from collections import defaultdict
 from datetime import date
-from typing import Dict
+from typing import Dict, Optional
 
 import pandas as pd
 import requests
@@ -56,7 +56,10 @@ def previous_season(season: str) -> str:
 
 
 def build_season_start_bootstrap(
-    players: pd.DataFrame, prior: pd.DataFrame, teams: pd.DataFrame
+    players: pd.DataFrame,
+    prior: pd.DataFrame,
+    teams: pd.DataFrame,
+    birth_dates: Optional[Dict[int, str]] = None,
 ) -> Dict:
     """Reconstruct a bootstrap-static payload as of GW1 of the season.
 
@@ -64,8 +67,14 @@ def build_season_start_bootstrap(
     on permanent player code), prices are rolled back to their season-start
     values, and everyone is marked available — injury news from the
     season's opening week is not in the archive.
+
+    Old archive seasons lack xGI (pre-2022/23) and birth dates
+    (pre-2024/25); missing xGI disables the luck regression for those
+    players, and `birth_dates` (permanent code -> ISO date) lets callers
+    backfill ages from newer data, which is hindsight-free.
     """
     prior_by_code = prior.set_index("code")
+    birth_dates = birth_dates or {}
     elements = []
     for row in players.itertuples():
         stats = (
@@ -73,29 +82,34 @@ def build_season_start_bootstrap(
             if row.code in prior_by_code.index
             else None
         )
+
+        def stat(name, cast, default):
+            value = getattr(stats, name, None) if stats is not None else None
+            return cast(value) if pd.notna(value) else default
+
         elements.append({
             "id": row.id,
             "web_name": row.web_name,
             "team": row.team,
             "element_type": row.element_type,
             "now_cost": row.now_cost - row.cost_change_start,
-            "birth_date": getattr(row, "birth_date", None),
+            "birth_date": (
+                getattr(row, "birth_date", None)
+                or birth_dates.get(row.code)
+            ),
             "status": "a",
             "chance_of_playing_next_round": None,
             "can_select": True,
             "removed": False,
             "news": "",
             "selected_by_percent": row.selected_by_percent,
-            "minutes": int(stats.minutes) if stats is not None else 0,
-            "points_per_game": (
-                float(stats.points_per_game) if stats is not None else 0.0
-            ),
-            "total_points": int(stats.total_points) if stats is not None else 0,
-            "goals_scored": int(stats.goals_scored) if stats is not None else 0,
-            "assists": int(stats.assists) if stats is not None else 0,
-            "expected_goal_involvements": (
-                float(stats.expected_goal_involvements)
-                if stats is not None else 0.0
+            "minutes": stat("minutes", int, 0),
+            "points_per_game": stat("points_per_game", float, 0.0),
+            "total_points": stat("total_points", int, 0),
+            "goals_scored": stat("goals_scored", int, 0),
+            "assists": stat("assists", int, 0),
+            "expected_goal_involvements": stat(
+                "expected_goal_involvements", float, 0.0
             ),
         })
 
@@ -110,14 +124,26 @@ def build_season_data(
 ) -> SeasonData:
     """Bundle per-GW scores, prices (carried forward), and fixtures."""
     scores: Dict[int, Dict[int, Dict]] = defaultdict(dict)
-    grouped = gws.groupby(["GW", "element"]).agg(
-        points=("total_points", "sum"),
-        minutes=("minutes", "sum"),
-        value=("value", "first"),
-    )
+    aggregates = {
+        "points": ("total_points", "sum"),
+        "minutes": ("minutes", "sum"),
+        "value": ("value", "first"),
+    }
+    # Crowd signal, where the archive has it. Ownership and transfer
+    # counts are frozen at each deadline, so they are knowable inputs
+    # for that gameweek's decisions, not hindsight.
+    for crowd in ("selected", "transfers_balance"):
+        if crowd in gws.columns:
+            aggregates[crowd] = (crowd, "first")
+    grouped = gws.groupby(["GW", "element"]).agg(**aggregates)
     for (gw, element), row in grouped.iterrows():
         scores[gw][element] = {
-            "points": int(row.points), "minutes": int(row.minutes)
+            "points": int(row.points),
+            "minutes": int(row.minutes),
+            "selected": int(getattr(row, "selected", 0) or 0),
+            "transfers_balance": int(
+                getattr(row, "transfers_balance", 0) or 0
+            ),
         }
 
     n_events = int(gws["GW"].max())

@@ -52,7 +52,7 @@ class SeasonData:
 
 @dataclass
 class ManagerConfig:
-    """Decision thresholds, all in projected points."""
+    """Decision thresholds (projected points) and learning rates."""
 
     ft_gain: float = 4.0        # horizon gain to spend a free transfer
     hit_gain: float = 10.0      # horizon gain to take a -4 hit
@@ -63,6 +63,27 @@ class ManagerConfig:
     # more (in practice: a double gameweek) before boosting.
     bench_boost_min: float = 14.0  # projected bench points to boost
     triple_captain_min: float = 11.0  # projected captain points to triple
+    # Learning rates: current-season minutes at which the pre-season
+    # prior drops to half weight, and the smoothing prior (in minutes)
+    # on the recent-minutes availability estimate.
+    blend_minutes: float = BLEND_MINUTES
+    avail_prior: float = 90.0
+    avail_window: int = 6
+    # Bench discount used when optimizing squads (GW1 and wildcards).
+    bench_weight: float = 0.15
+    # Crowd wisdom: scale on the net-transfer share of ownership at the
+    # deadline (the crowd reacts to news the minutes-proxy sees late).
+    # 0 disables.
+    crowd_weight: float = 0.0
+    # Captaincy ceiling bias: the armband doubles points, so prefer
+    # high-ceiling (pricier) starters — score = proj + bias * cost.
+    # +0.3 was worth ~+10 pts/season across 8 backtest seasons; the
+    # crowd_weight and form_halflife knobs tested flat-to-negative and
+    # default off.
+    captain_bias: float = 0.3
+    # Half-life (in gameweeks) for recency weighting of current-season
+    # points-per-appearance. None = plain season average.
+    form_halflife: Optional[float] = None
 
 
 @dataclass
@@ -146,7 +167,10 @@ class SeasonManager:
         self.data = data
         self.config = config or ManagerConfig()
 
-        initial = optimize_squad(projections, budget=budget)
+        initial = optimize_squad(
+            projections, budget=budget,
+            bench_weight=self.config.bench_weight,
+        )
         self.squad_ids = [p.id for p in initial.players]
         self.purchase_price = {
             p.id: data.prices[1].get(p.id, int(p.cost * 10))
@@ -162,6 +186,7 @@ class SeasonManager:
         self.minutes_played = defaultdict(int)  # pid -> mins
         self.appearances = defaultdict(int)     # pid -> games with minutes
         self.minute_history = defaultdict(list)  # pid -> [(fixtures, mins)]
+        self.appearance_history = defaultdict(list)  # pid -> [(gw, pts)]
 
     # ------------------------------------------------------------------
     # Projections
@@ -174,22 +199,52 @@ class SeasonManager:
 
     def _availability(self, pid: int) -> float:
         """Share of recent possible minutes, lightly smoothed."""
-        history = self.minute_history[pid][-6:]
+        history = self.minute_history[pid][-self.config.avail_window:]
         fixtures = sum(f for f, _ in history)
         minutes = sum(m for _, m in history)
         if fixtures == 0:
             return 1.0
-        return min(1.0, (minutes + 90) / (90 * fixtures + 90))
+        prior = self.config.avail_prior
+        return min(1.0, (minutes + prior) / (90 * fixtures + prior))
 
-    def _blended_ppg(self, pid: int) -> float:
+    def _current_ppg(self, pid: int, gw: int) -> float:
+        """Current-season points per appearance, optionally recency-
+        weighted with an exponential half-life."""
+        halflife = self.config.form_halflife
+        if halflife is None:
+            return self.points_scored[pid] / max(1, self.appearances[pid])
+        history = self.appearance_history[pid]
+        if not history:
+            return 0.0
+        weighted = total = 0.0
+        for played_gw, points in history:
+            weight = 0.5 ** ((gw - played_gw) / halflife)
+            weighted += weight * points
+            total += weight
+        return weighted / total
+
+    def _blended_ppg(self, pid: int, gw: int) -> float:
         minutes = self.minutes_played[pid]
-        weight = BLEND_MINUTES / (BLEND_MINUTES + minutes)
-        current = self.points_scored[pid] / max(1, self.appearances[pid])
+        blend = self.config.blend_minutes
+        weight = blend / (blend + minutes)
+        current = self._current_ppg(pid, gw)
         return weight * self.preseason_ppg[pid] + (1 - weight) * current
+
+    def _crowd_factor(self, gw: int, pid: int) -> float:
+        """Deadline transfer momentum as an availability/news proxy."""
+        weight = self.config.crowd_weight
+        if not weight:
+            return 1.0
+        row = self.data.scores.get(gw, {}).get(pid)
+        if not row or not row.get("selected"):
+            return 1.0
+        ratio = row.get("transfers_balance", 0) / row["selected"]
+        return 1.0 + max(-0.5, min(0.1, weight * ratio))
 
     def weekly_projection(self, gw: int) -> Dict[int, float]:
         return {
-            pid: self._blended_ppg(pid) * self._availability(pid)
+            pid: self._blended_ppg(pid, gw) * self._availability(pid)
+            * self._crowd_factor(gw, pid)
             * self._fixture_sum(gw, p.team_id)
             for pid, p in self.players.items()
         }
@@ -197,7 +252,8 @@ class SeasonManager:
     def horizon_projection(self, gw: int) -> Dict[int, float]:
         end = min(gw + HORIZON, self.data.n_events + 1)
         return {
-            pid: self._blended_ppg(pid) * self._availability(pid)
+            pid: self._blended_ppg(pid, gw) * self._availability(pid)
+            * self._crowd_factor(gw, pid)
             * sum(self._fixture_sum(e, p.team_id) for e in range(gw, end))
             for pid, p in self.players.items()
         }
@@ -283,7 +339,10 @@ class SeasonManager:
             clone.projected_ppg = projection[player.id]
             clone.cost = self._price(gw, player.id) / 10.0
             candidates.append(clone)
-        squad = optimize_squad(candidates, budget=budget_tenths / 10.0)
+        squad = optimize_squad(
+            candidates, budget=budget_tenths / 10.0,
+            bench_weight=self.config.bench_weight,
+        )
         return [p.id for p in squad.players]
 
     # ------------------------------------------------------------------
@@ -305,7 +364,11 @@ class SeasonManager:
 
         points = sum(week.get(p.id, {}).get("points", 0) for p in lineup)
 
-        ranked = sorted(starters, key=lambda p: -weekly.get(p.id, 0.0))
+        bias = self.config.captain_bias
+        ranked = sorted(
+            starters,
+            key=lambda p: -(weekly.get(p.id, 0.0) + bias * p.cost),
+        )
         multiplier = 3 if result.chip == "TC" else 2
         for leader in ranked[:2]:  # captain, then vice
             if week.get(leader.id, {}).get("minutes", 0) > 0:
@@ -376,6 +439,7 @@ class SeasonManager:
             self.minutes_played[pid] += stats["minutes"]
             if stats["minutes"] > 0:
                 self.appearances[pid] += 1
+                self.appearance_history[pid].append((gw, stats["points"]))
             if fixtures:
                 self.minute_history[pid].append((fixtures, stats["minutes"]))
 

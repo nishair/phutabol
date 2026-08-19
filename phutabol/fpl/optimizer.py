@@ -58,7 +58,9 @@ class Squad:
 
 
 def optimize_squad(
-    players: List[ProjectedPlayer], budget: float = 100.0
+    players: List[ProjectedPlayer],
+    budget: float = 100.0,
+    bench_weight: float = BENCH_WEIGHT,
 ) -> Squad:
     """Pick the highest-projected legal squad within the budget."""
     n = len(players)
@@ -69,9 +71,9 @@ def optimize_squad(
     costs = np.array([p.cost for p in players])
 
     # Variables: x (in squad) followed by y (in starting XI).
-    # Objective (maximise): sum(y * proj) + BENCH_WEIGHT * sum((x - y) * proj)
+    # Objective (maximise): sum(y * proj) + bench_weight * sum((x - y) * proj)
     objective = -np.concatenate(
-        [BENCH_WEIGHT * projections, (1 - BENCH_WEIGHT) * projections]
+        [bench_weight * projections, (1 - bench_weight) * projections]
     )
 
     constraints = []
