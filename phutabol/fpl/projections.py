@@ -11,14 +11,18 @@ and transparent:
   baseline in proportion to minutes played (low-minute players carry
   little evidence).
 - luck_adjustment: attackers whose actual goal involvements ran ahead of
-  their xGI are lightly regressed down, and vice versa.
+  their xGI are regressed down, and vice versa.
+- age_adjustment: premium-age decline discount for players past their
+  positional peak (backtests showed prior-season PPG badly overrates
+  ageing premiums).
 - availability: injury/suspension status and chance-of-playing.
 - fixture_factor: average FPL fixture difficulty over the next few
   gameweeks, centred on a neutral difficulty of 3.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Any
+from datetime import date
+from typing import Dict, List, Any, Optional
 
 # Positional baselines (points per game) that low-evidence players are
 # shrunk toward — roughly what a fringe starter returns.
@@ -78,9 +82,36 @@ def _luck_adjustment(element: Dict[str, Any], position: int) -> float:
     if goal_involvements < 3 or expected <= 0:
         return 1.0
     ratio = expected / goal_involvements
-    # Blend 30% of the xGI signal in, clipped to a modest band.
-    adjustment = 0.7 + 0.3 * ratio
-    return max(0.85, min(1.1, adjustment))
+    # Blend half of the xGI signal in. The band is deliberately wide:
+    # a 0.85 floor left 2024/25 overperformers (Salah, Wood, Wissa)
+    # barely trimmed, which the 2025/26 backtest punished.
+    adjustment = 0.5 + 0.5 * ratio
+    return max(0.72, min(1.15, adjustment))
+
+
+# Age (at season start) past which projections are discounted, per
+# position, and the per-year discount beyond it. Keepers age slowest.
+AGE_PEAK_END = {1: 34, 2: 30, 3: 29, 4: 29}
+AGE_DECLINE_PER_YEAR = 0.04
+AGE_FLOOR = 0.78
+
+
+def _age_adjustment(
+    element: Dict[str, Any], position: int, as_of: date
+) -> float:
+    """Discount players past their positional peak age."""
+    birth = element.get("birth_date")
+    if not birth:
+        return 1.0
+    try:
+        born = date.fromisoformat(str(birth)[:10])
+    except ValueError:
+        return 1.0
+    age = (as_of - born).days / 365.25
+    years_past_peak = age - AGE_PEAK_END[position]
+    if years_past_peak <= 0:
+        return 1.0
+    return max(AGE_FLOOR, 1.0 - AGE_DECLINE_PER_YEAR * years_past_peak)
 
 
 def _fixture_factors(
@@ -111,8 +142,14 @@ def build_projections(
     fixtures: List[Dict[str, Any]],
     next_event: int,
     horizon: int = 6,
+    as_of: Optional[date] = None,
 ) -> List[ProjectedPlayer]:
-    """Project points-per-game for every selectable player."""
+    """Project points-per-game for every selectable player.
+
+    `as_of` anchors the age adjustment (defaults to today); backtests
+    should pass the historical season-start date.
+    """
+    as_of = as_of or date.today()
     team_names = {t["id"]: t["short_name"] for t in bootstrap["teams"]}
     fixture_factors = _fixture_factors(fixtures, next_event, horizon)
 
@@ -136,6 +173,7 @@ def build_projections(
         projected = (
             shrunk_ppg
             * _luck_adjustment(element, position)
+            * _age_adjustment(element, position, as_of)
             * availability
             * fixture_factors.get(element["team"], 1.0)
         )

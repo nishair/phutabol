@@ -4,14 +4,13 @@ Backtest the FPL squad optimizer against a completed season.
 
 Rebuilds the information state at the start of a season (previous-season
 stats, GW1 prices, fixture difficulty), runs the exact production
-pipeline (build_projections -> optimize_squad), then replays every
-gameweek with actual scores, FPL auto-substitution rules, and
-captain/vice doubling.
+pipeline (build_projections -> optimize_squad), then replays the season
+two ways:
 
-Assumptions (stated, since they differ from a real manager's season):
-- no transfers, no chips: the GW1 squad is held all season
-- season-long captain = model captain (vice steps in on blanks)
-- everyone assumed fit at the season-start pick (no injury news)
+1. static  — the GW1 squad held all season (no transfers, no chips)
+2. managed — SeasonManager plays every week: re-picked XI and captain,
+   1 bankable free transfer, -4 hits, wildcards, free hit, bench boost,
+   triple captain
 
 Data: vaastav/Fantasy-Premier-League GitHub archive (per-GW scores,
 season-end stats, fixtures). Players are joined across seasons on their
@@ -24,21 +23,21 @@ Usage:
 import argparse
 import io
 from collections import defaultdict
-from typing import Dict, List
+from datetime import date
+from typing import Dict
 
 import pandas as pd
 import requests
 
 from phutabol.fpl import build_projections, optimize_squad
-from phutabol.fpl.projections import ProjectedPlayer
+from phutabol.fpl.season import (
+    SeasonData, SeasonManager, apply_auto_subs, pick_weekly_xi,
+)
 
 ARCHIVE = (
     "https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League"
     "/master/data"
 )
-
-# Formation minimums that auto-substitution must preserve.
-XI_MINIMUMS = {1: 1, 2: 3, 3: 2, 4: 1}
 
 
 def fetch_csv(path: str) -> pd.DataFrame:
@@ -80,6 +79,7 @@ def build_season_start_bootstrap(
             "team": row.team,
             "element_type": row.element_type,
             "now_cost": row.now_cost - row.cost_change_start,
+            "birth_date": getattr(row, "birth_date", None),
             "status": "a",
             "chance_of_playing_next_round": None,
             "can_select": True,
@@ -105,65 +105,60 @@ def build_season_start_bootstrap(
     }
 
 
-def gameweek_scores(gws: pd.DataFrame) -> Dict[int, Dict[int, Dict]]:
-    """{gw: {element_id: {points, minutes}}}, double gameweeks summed."""
+def build_season_data(
+    gws: pd.DataFrame, fixtures: pd.DataFrame, start_prices: Dict[int, int]
+) -> SeasonData:
+    """Bundle per-GW scores, prices (carried forward), and fixtures."""
     scores: Dict[int, Dict[int, Dict]] = defaultdict(dict)
     grouped = gws.groupby(["GW", "element"]).agg(
-        points=("total_points", "sum"), minutes=("minutes", "sum")
+        points=("total_points", "sum"),
+        minutes=("minutes", "sum"),
+        value=("value", "first"),
     )
     for (gw, element), row in grouped.iterrows():
         scores[gw][element] = {
             "points": int(row.points), "minutes": int(row.minutes)
         }
-    return scores
 
+    n_events = int(gws["GW"].max())
+    prices: Dict[int, Dict[int, int]] = {}
+    last = dict(start_prices)
+    for gw in range(1, n_events + 1):
+        if gw in scores:
+            for (gw_key, element), row in grouped.loc[[gw]].iterrows():
+                last[element] = int(row.value)
+        prices[gw] = dict(last)
 
-def apply_auto_subs(
-    starters: List[ProjectedPlayer],
-    bench: List[ProjectedPlayer],
-    week: Dict[int, Dict],
-) -> List[ProjectedPlayer]:
-    """Replace non-playing starters from the bench, FPL-style."""
-    def played(p: ProjectedPlayer) -> bool:
-        return week.get(p.id, {}).get("minutes", 0) > 0
-
-    lineup = list(starters)
-    available_bench = [p for p in bench if played(p)]
-
-    for i, starter in enumerate(list(lineup)):
-        if played(starter):
+    fixture_map: Dict[int, Dict[int, list]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for row in fixtures.itertuples():
+        if pd.isna(row.event):
             continue
-        for sub in list(available_bench):
-            # Keepers swap only with keepers; outfielders with outfielders.
-            if (starter.position == 1) != (sub.position == 1):
-                continue
-            counts = defaultdict(int)
-            for p in lineup:
-                counts[p.position] += 1
-            counts[starter.position] -= 1
-            counts[sub.position] += 1
-            if all(counts[pos] >= XI_MINIMUMS[pos] for pos in XI_MINIMUMS):
-                lineup[i] = sub
-                available_bench.remove(sub)
-                break
-    return lineup
+        event = int(row.event)
+        fixture_map[event][row.team_h].append(int(row.team_h_difficulty))
+        fixture_map[event][row.team_a].append(int(row.team_a_difficulty))
+
+    return SeasonData(
+        scores=dict(scores),
+        prices=prices,
+        fixtures={k: dict(v) for k, v in fixture_map.items()},
+        n_events=n_events,
+    )
 
 
-def simulate_season(squad, scores: Dict[int, Dict[int, Dict]]) -> pd.DataFrame:
-    """Replay the season week by week with a static squad."""
-    rows = []
-    for gw in sorted(scores):
-        week = scores[gw]
+def simulate_static(squad, data: SeasonData) -> int:
+    """Hold the GW1 squad all season; fixed captain/vice; auto-subs."""
+    total = 0
+    for gw in range(1, data.n_events + 1):
+        week = data.scores.get(gw, {})
         lineup = apply_auto_subs(squad.starters, squad.bench, week)
-        base = sum(week.get(p.id, {}).get("points", 0) for p in lineup)
-
-        armband = 0
+        total += sum(week.get(p.id, {}).get("points", 0) for p in lineup)
         for leader in (squad.captain, squad.vice_captain):
             if week.get(leader.id, {}).get("minutes", 0) > 0:
-                armband = week[leader.id]["points"]
+                total += week[leader.id]["points"]
                 break
-        rows.append({"GW": gw, "points": base + armband})
-    return pd.DataFrame(rows)
+    return total
 
 
 def main() -> None:
@@ -182,12 +177,18 @@ def main() -> None:
     fixtures = fetch_csv(f"{args.season}/fixtures.csv")
 
     bootstrap = build_season_start_bootstrap(players, prior_players, teams)
+    season_start = date(int(args.season.split("-")[0]), 8, 1)
     projections = build_projections(
-        bootstrap, fixtures.to_dict("records"), next_event=1
+        bootstrap, fixtures.to_dict("records"), next_event=1,
+        as_of=season_start,
     )
-    squad = optimize_squad(projections, budget=args.budget)
 
+    start_prices = {e["id"]: e["now_cost"] for e in bootstrap["elements"]}
+    data = build_season_data(gws, fixtures, start_prices)
     season_totals = players.set_index("id")["total_points"]
+
+    # --- Static replay -------------------------------------------------
+    squad = optimize_squad(projections, budget=args.budget)
     print(f"\nGW1 squad (£{squad.total_cost}m):")
     for player in squad.players:
         role = ""
@@ -201,25 +202,35 @@ def main() -> None:
               f"actual {args.season} pts: "
               f"{season_totals.get(player.id, 0)}{bench_tag}")
 
-    scores = gameweek_scores(gws)
-    results = simulate_season(squad, scores)
+    static_total = simulate_static(squad, data)
 
-    total = results["points"].sum()
-    print(f"\n{'='*56}")
-    print(f"Season total (no transfers, no chips): {total} pts")
-    print(f"Average per GW: {results['points'].mean():.1f}   "
-          f"Best GW: {results['points'].max()} (GW"
-          f"{results.loc[results['points'].idxmax(), 'GW']})   "
-          f"Worst GW: {results['points'].min()} (GW"
-          f"{results.loc[results['points'].idxmin(), 'GW']})")
+    # --- Managed replay ------------------------------------------------
+    manager = SeasonManager(projections, data, budget=args.budget)
+    weeks = manager.run()
+    managed_total = sum(w.points for w in weeks)
+    n_transfers = sum(len(w.transfers) for w in weeks)
+    n_hits = sum(w.hits for w in weeks)
 
-    # Hindsight ceiling: same optimizer fed actual season totals.
+    print(f"\n{'='*60}")
+    print(f"Static squad (no transfers, no chips):  {static_total} pts")
+    print(f"Managed season:                         {managed_total} pts")
+    print(f"{'='*60}")
+    print(f"Transfers: {n_transfers} ({n_hits} hits, -{4*n_hits} pts)   "
+          f"Avg/GW: {managed_total / len(weeks):.1f}")
+    for week in weeks:
+        if week.chip:
+            print(f"  {week.chip:<4} played GW{week.gw}: {week.points} pts")
+    best = max(weeks, key=lambda w: w.points)
+    worst = min(weeks, key=lambda w: w.points)
+    print(f"  Best GW{best.gw}: {best.points}   Worst GW{worst.gw}: "
+          f"{worst.points}")
+
+    # --- Hindsight ceiling (static, same rules) ------------------------
     for projection in projections:
         projection.projected_ppg = season_totals.get(projection.id, 0) / 38.0
     ceiling = optimize_squad(projections, budget=args.budget)
-    ceiling_results = simulate_season(ceiling, scores)
-    print(f"Perfect-hindsight static squad, same rules: "
-          f"{ceiling_results['points'].sum()} pts")
+    print(f"\nPerfect-hindsight static squad, same static rules: "
+          f"{simulate_static(ceiling, data)} pts")
 
 
 if __name__ == "__main__":
