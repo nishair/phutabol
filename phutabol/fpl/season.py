@@ -40,6 +40,12 @@ VALID_FORMATIONS = [
 ]
 
 
+def difficulty_factor_sum(difficulties: List[int]) -> float:
+    """Summed fixture factor for one team-gameweek (0 for a blank,
+    >1 per easy fixture, doubled naturally on double gameweeks)."""
+    return sum(1.0 + (3 - d) * FIXTURE_SWING for d in difficulties)
+
+
 @dataclass
 class SeasonData:
     """Everything knowable about a season, keyed by gameweek."""
@@ -194,8 +200,9 @@ class SeasonManager:
 
     def _fixture_sum(self, gw: int, team_id: int) -> float:
         """Summed difficulty factor over a team's fixtures in one GW."""
-        difficulties = self.data.fixtures.get(gw, {}).get(team_id, [])
-        return sum(1.0 + (3 - d) * FIXTURE_SWING for d in difficulties)
+        return difficulty_factor_sum(
+            self.data.fixtures.get(gw, {}).get(team_id, [])
+        )
 
     def _availability(self, pid: int) -> float:
         """Share of recent possible minutes, lightly smoothed."""
@@ -266,9 +273,13 @@ class SeasonManager:
         return self.data.prices[gw].get(pid, self.purchase_price.get(pid, 45))
 
     def _sale_price(self, gw: int, pid: int) -> int:
+        """FPL sell-on rule: keep half of any rise; drops are fully
+        borne (a fallen player sells at his current price)."""
         bought = self.purchase_price[pid]
         current = self._price(gw, pid)
-        return bought + max(0, (current - bought) // 2)
+        if current <= bought:
+            return current
+        return bought + (current - bought) // 2
 
     def _squad_sale_value(self, gw: int) -> int:
         return sum(self._sale_price(gw, pid) for pid in self.squad_ids)

@@ -25,7 +25,7 @@ from .client import FPLClient
 from .optimizer import optimize_squad
 from .projections import ProjectedPlayer, build_projections
 from .season import (
-    FIXTURE_SWING, HORIZON, ManagerConfig, pick_weekly_xi,
+    HORIZON, ManagerConfig, difficulty_factor_sum, pick_weekly_xi,
 )
 
 CACHE_DIR = Path(".fpl_cache")
@@ -201,8 +201,9 @@ class Advisor:
             )
 
     def _fixture_sum(self, event: int, team_id: int) -> float:
-        difficulties = self.fixture_map.get(event, {}).get(team_id, [])
-        return sum(1.0 + (3 - d) * FIXTURE_SWING for d in difficulties)
+        return difficulty_factor_sum(
+            self.fixture_map.get(event, {}).get(team_id, [])
+        )
 
     def weekly_projection(self, event: int) -> Dict[int, float]:
         return {
@@ -225,9 +226,13 @@ class Advisor:
     # ------------------------------------------------------------------
 
     def _sale_price(self, state: TeamState, pid: int) -> int:
+        """FPL sell-on rule: keep half of any rise; drops are fully
+        borne (a fallen player sells at his current price)."""
         bought = state.purchase_price.get(pid, 45)
         current = int(self.players[pid].cost * 10)
-        return bought + max(0, (current - bought) // 2)
+        if current <= bought:
+            return current
+        return bought + (current - bought) // 2
 
     def _best_swaps(
         self, state: TeamState, horizon: Dict[int, float], limit: int
