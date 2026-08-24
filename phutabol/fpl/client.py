@@ -70,12 +70,17 @@ class FPLClient:
         return self._get_json(f"entry/{team_id}/transfers/") or []
 
     def get_next_event(self) -> Dict[str, Any]:
-        """Return the next (or current) gameweek."""
+        """Return the next gameweek whose deadline hasn't passed.
+
+        FPL flags: `is_next` marks the upcoming deadline; `is_current`
+        marks the latest gameweek whose deadline already passed, so it
+        is only a fallback (season over / pre-season edge cases).
+        """
         events = self.get_bootstrap()["events"]
         for event in events:
-            if event.get("is_current"):
+            if event.get("is_next"):
                 return event
         for event in events:
-            if event.get("is_next"):
+            if event.get("is_current"):
                 return event
         return events[0]
