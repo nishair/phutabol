@@ -372,5 +372,24 @@ python fpl_tune.py                       # multi-season config sweeps
 
 `fpl_manage.py` reads your real squad from the public API (your team ID
 is in the site URL), then recommends transfers, XI, captain, and chip
-for the next deadline. The model handles the stats — you hold the veto
-on late team news.
+for the next deadline. When it recommends a wildcard or free hit it
+prints the rebuilt squad it has in mind (OUT/IN plus the new XI). The
+model handles the stats — you hold the veto on late team news.
+
+### Automated alerts
+
+`fpl_watch.py` runs the advisor for you on a schedule and alerts on
+squad news:
+
+```bash
+./install_fpl_watch.sh <TEAM_ID>            # launchd agent, every 30 min
+sudo ./install_fpl_watch.sh --daemon <TEAM_ID>  # from boot, no login (e.g. a Mac mini)
+```
+
+Each pass produces the full deadline plan 24 hours ahead (once per
+gameweek, refreshed if news breaks after), and notifies on any change
+to your players' injury flags, chance of playing, news, or price.
+Alerts go to macOS notifications and, if configured via
+`python fpl_watch.py --setup-telegram <BOT_TOKEN>` (or an `ntfy_topic`
+in `~/.phutabol/notify.json`), to your phone — Telegram receives the
+complete plan text. State and plans live in `~/.phutabol/`.

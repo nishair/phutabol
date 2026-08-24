@@ -74,7 +74,12 @@ def main() -> None:
 
     if advice.chip:
         print(f"CHIP: play your {advice.chip.upper()} — "
-              f"{advice.chip_reason}\n")
+              f"{advice.chip_reason}")
+        if advice.chip_out or advice.chip_in:
+            print(f"  OUT: {', '.join(advice.chip_out)}")
+            print(f"  IN:  {', '.join(advice.chip_in)}")
+            print("  (XI and bench below are the rebuilt squad)")
+        print()
 
     if advice.transfers:
         print("TRANSFERS:")
