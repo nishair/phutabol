@@ -389,6 +389,12 @@ sudo ./install_fpl_watch.sh --daemon <TEAM_ID>  # from boot, no login (e.g. a Ma
 Each pass produces the full deadline plan 24 hours ahead (once per
 gameweek, refreshed if news breaks after), and notifies on any change
 to your players' injury flags, chance of playing, news, or price.
+Every 24 hours it also sends a check-in digest (watcher alive, runs
+since last digest, deadline countdown, plan status, flagged players,
+and any changes in the window) so silence is never ambiguous. Tune with
+`--heartbeat-hours N`, or `--heartbeat-hours 0` to switch it off. The
+digest goes to Telegram/ntfy only, never a macOS popup.
+
 Alerts go to macOS notifications and, if configured via
 `python fpl_watch.py --setup-telegram <BOT_TOKEN>` (or an `ntfy_topic`
 in `~/.phutabol/notify.json`), to your phone — Telegram receives the

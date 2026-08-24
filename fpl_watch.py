@@ -85,7 +85,8 @@ def send_ntfy(config: Dict, title: str, message: str) -> None:
 
 
 def notify(
-    title: str, message: str, enabled: bool, body: Optional[str] = None
+    title: str, message: str, enabled: bool, body: Optional[str] = None,
+    local: bool = True,
 ) -> None:
     """Print always; when enabled, fan out to configured channels.
 
@@ -103,6 +104,8 @@ def notify(
         send_telegram(config, text)
     if config.get("ntfy_topic"):
         send_ntfy(config, title, message)
+    if not local:
+        return
     # Local notification too, when a GUI session exists (a headless
     # daemon run just fails this quietly).
     script = 'display notification "{}" with title "{}"'.format(
@@ -146,6 +149,73 @@ def setup_telegram(token: str) -> int:
     print(f"Saved {path} for chat {chat_id} (@{username}) and sent a "
           f"test message.")
     return 0
+
+
+def heartbeat_due(state: Dict, every_hours: float) -> bool:
+    """True on the first run, then once per `every_hours`."""
+    last = state.get("last_heartbeat")
+    if not last:
+        return True
+    elapsed = (
+        datetime.now(timezone.utc) - datetime.fromisoformat(last)
+    ).total_seconds() / 3600
+    return elapsed >= every_hours
+
+
+def build_heartbeat(
+    state: Dict,
+    bootstrap: Dict,
+    squad_now: Dict[str, Dict],
+    event: Dict,
+    hours_left: float,
+    hours_before: float,
+) -> str:
+    """A proof-of-life digest: what the scheduler did since last time."""
+    deadline = datetime.fromisoformat(
+        event["deadline_time"].replace("Z", "+00:00")
+    ).astimezone()
+    names = {str(e["id"]): e["web_name"] for e in bootstrap["elements"]}
+
+    lines = [
+        "Watcher alive - {} pass(es) since last check-in.".format(
+            state.get("runs", 0)
+        ),
+        "GW{} deadline: {} (in {:.0f}h)".format(
+            event["id"], deadline.strftime("%a %d %b %H:%M %Z"), hours_left
+        ),
+    ]
+    if state.get("planned_event") == event["id"]:
+        lines.append(f"Plan: GW{event['id']} sent - see plans/gw{event['id']}.txt")
+    else:
+        lines.append(
+            "Plan: generates {:.0f}h before deadline (in {:.0f}h)".format(
+                hours_before, max(0.0, hours_left - hours_before)
+            )
+        )
+
+    flagged = []
+    for pid, info in squad_now.items():
+        chance = info.get("chance")
+        if info.get("status") != "a" or chance not in (None, 100):
+            flagged.append(
+                "{} ({}%)".format(names.get(pid, pid), chance
+                                  if chance is not None else "?")
+            )
+    lines.append(
+        "Squad: {} tracked, {}".format(
+            len(squad_now),
+            "all available" if not flagged
+            else f"{len(flagged)} flagged - " + ", ".join(flagged[:5]),
+        )
+    )
+
+    recent = state.get("recent_changes", [])
+    if recent:
+        lines.append(f"Changes since last check-in ({len(recent)}):")
+        lines.extend(f"  {c}" for c in recent[-10:])
+    else:
+        lines.append("Changes since last check-in: none")
+    return "\n".join(lines)
 
 
 def load_state(path: Path) -> Dict:
@@ -233,6 +303,10 @@ def main() -> int:
         help="passed through to fpl_manage.py",
     )
     parser.add_argument(
+        "--heartbeat-hours", type=float, default=24.0,
+        help="send a proof-of-life digest this often (0 disables)",
+    )
+    parser.add_argument(
         "--no-notify", action="store_true",
         help="print alerts instead of sending macOS notifications",
     )
@@ -264,6 +338,15 @@ def main() -> int:
     squad_now = snapshot_squad(bootstrap, team_state.squad_ids)
     changes = describe_changes(bootstrap, state["players"], squad_now)
 
+    state.setdefault("runs", 0)
+    state.setdefault("recent_changes", [])
+    state.setdefault("last_heartbeat", None)
+    state["runs"] += 1
+    if changes:
+        stamp = datetime.now(timezone.utc).strftime("%a %H:%M UTC")
+        state["recent_changes"].extend(f"{stamp} - {c}" for c in changes)
+        state["recent_changes"] = state["recent_changes"][-25:]
+
     plan_current = state["planned_event"] == event["id"]
     if hours_left <= args.hours_before and (
         not plan_current or (changes and hours_left > 0)
@@ -287,6 +370,22 @@ def main() -> int:
 
     for change in changes:
         print(f"  {change}")
+
+    if args.heartbeat_hours > 0 and heartbeat_due(
+        state, args.heartbeat_hours
+    ):
+        notify(
+            "FPL watcher - check-in",
+            build_heartbeat(
+                state, bootstrap, squad_now, event, hours_left,
+                args.hours_before,
+            ),
+            enabled=not args.no_notify,
+            local=False,
+        )
+        state["last_heartbeat"] = datetime.now(timezone.utc).isoformat()
+        state["runs"] = 0
+        state["recent_changes"] = []
 
     state["players"] = squad_now
     state_path.parent.mkdir(parents=True, exist_ok=True)
