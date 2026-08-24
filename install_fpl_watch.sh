@@ -34,16 +34,29 @@ REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 PYTHON="$REPO_DIR/.venv/bin/python"
 [ -x "$PYTHON" ] || PYTHON="$(command -v python3)"
 LABEL="com.phutabol.fpl-watch"
-LOG_DIR="$HOME/.phutabol"
+
+# --daemon needs sudo, which rewrites the identity this script would
+# otherwise inherit: $(whoami) becomes root, $UID becomes 0, and
+# $HOME may or may not be preserved. Resolve the *invoking* user
+# instead -- the daemon must run as them so fpl_watch.py's Path.home()
+# finds ~/.phutabol/notify.json, and so the log stays theirs to read.
+RUN_USER="${SUDO_USER:-$(whoami)}"
+RUN_UID="${SUDO_UID:-$UID}"
+RUN_HOME="$(dscl . -read "/Users/$RUN_USER" NFSHomeDirectory 2>/dev/null \
+    | awk '{print $2}')"
+[ -n "$RUN_HOME" ] || RUN_HOME="$HOME"
+
+LOG_DIR="$RUN_HOME/.phutabol"
 mkdir -p "$LOG_DIR"
+chown "$RUN_USER" "$LOG_DIR" 2>/dev/null || true
 
 if [ "$DAEMON" = 1 ]; then
     PLIST="/Library/LaunchDaemons/$LABEL.plist"
-    EXTRA_KEYS="<key>UserName</key><string>$(whoami)</string>"
+    EXTRA_KEYS="<key>UserName</key><string>$RUN_USER</string>"
 else
-    PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+    PLIST="$RUN_HOME/Library/LaunchAgents/$LABEL.plist"
     EXTRA_KEYS=""
-    mkdir -p "$HOME/Library/LaunchAgents"
+    mkdir -p "$RUN_HOME/Library/LaunchAgents"
 fi
 
 CONTENT=$(cat <<EOF
@@ -63,6 +76,8 @@ CONTENT=$(cat <<EOF
         <string>$HOURS_BEFORE</string>
     </array>
     <key>WorkingDirectory</key><string>$REPO_DIR</string>
+    <key>EnvironmentVariables</key>
+    <dict><key>HOME</key><string>$RUN_HOME</string></dict>
     <key>StartInterval</key><integer>1800</integer>
     <key>RunAtLoad</key><true/>
     <key>StandardOutPath</key><string>$LOG_DIR/watch.log</string>
@@ -73,14 +88,17 @@ EOF
 )
 
 # Clear any previous install in either scope before loading.
-launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
+launchctl bootout "gui/$RUN_UID/$LABEL" 2>/dev/null || true
 if [ "$DAEMON" = 1 ]; then
+    # Drop the agent's plist too, or a later login reloads a second
+    # copy alongside the daemon and both race on the same state file.
+    rm -f "$RUN_HOME/Library/LaunchAgents/$LABEL.plist"
     sudo launchctl bootout "system/$LABEL" 2>/dev/null || true
     echo "$CONTENT" | sudo tee "$PLIST" > /dev/null
     sudo launchctl bootstrap system "$PLIST"
 else
     echo "$CONTENT" > "$PLIST"
-    launchctl bootstrap "gui/$UID" "$PLIST"
+    launchctl bootstrap "gui/$RUN_UID" "$PLIST"
 fi
 
 echo "Installed $PLIST — runs every 30 min; log: $LOG_DIR/watch.log"
