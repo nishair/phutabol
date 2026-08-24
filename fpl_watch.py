@@ -14,8 +14,17 @@ minutes). Each run is one cheap pass:
 
 State lives in ~/.phutabol/ so runs are independent and idempotent —
 you get at most one plan alert per gameweek, and one alert per actual
-change. Notifications use macOS `osascript`; --no-notify prints to
-stdout instead (useful for logs and testing).
+change.
+
+Notifications go to every channel configured in ~/.phutabol/notify.json
+(Telegram gets the full plan text; ntfy.sh gets a push), plus a local
+macOS notification when a GUI session exists. With no config the local
+notification is all you get. --no-notify prints to stdout instead
+(useful for logs and testing).
+
+One-time Telegram setup: create a bot with @BotFather, send it any
+message from your account, then:
+    python fpl_watch.py --setup-telegram BOT_TOKEN
 
 Usage:
     python fpl_watch.py TEAM_ID [--hours-before 24] [--no-notify]
@@ -28,6 +37,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
+
+import requests
 
 from phutabol.fpl import FPLClient
 from phutabol.fpl.advisor import fetch_team_state
@@ -43,15 +54,98 @@ WATCHED_FIELDS = {
 }
 
 
-def notify(title: str, message: str, enabled: bool) -> None:
+def load_notify_config() -> Dict:
+    path = STATE_DIR / "notify.json"
+    if path.exists():
+        return json.loads(path.read_text())
+    return {}
+
+
+def send_telegram(config: Dict, text: str) -> None:
+    response = requests.post(
+        "https://api.telegram.org/bot{}/sendMessage".format(
+            config["telegram_token"]
+        ),
+        json={"chat_id": config["telegram_chat_id"], "text": text[:4000]},
+        timeout=20,
+    )
+    if not response.ok:
+        print(f"telegram send failed: {response.text[:200]}")
+
+
+def send_ntfy(config: Dict, title: str, message: str) -> None:
+    response = requests.post(
+        f"https://ntfy.sh/{config['ntfy_topic']}",
+        data=message.encode(),
+        headers={"Title": title.encode("ascii", "ignore")},
+        timeout=20,
+    )
+    if not response.ok:
+        print(f"ntfy send failed: {response.text[:200]}")
+
+
+def notify(
+    title: str, message: str, enabled: bool, body: Optional[str] = None
+) -> None:
+    """Print always; when enabled, fan out to configured channels.
+
+    `body` (the full plan text) rides along on Telegram, which fits it;
+    push/local notifications carry only the short message.
+    """
     print(f"[{title}] {message}")
     if not enabled:
         return
+    config = load_notify_config()
+    if config.get("telegram_token") and config.get("telegram_chat_id"):
+        text = f"{title}\n{message}"
+        if body:
+            text += f"\n\n{body}"
+        send_telegram(config, text)
+    if config.get("ntfy_topic"):
+        send_ntfy(config, title, message)
+    # Local notification too, when a GUI session exists (a headless
+    # daemon run just fails this quietly).
     script = 'display notification "{}" with title "{}"'.format(
         message.replace("\\", "\\\\").replace('"', '\\"'),
         title.replace("\\", "\\\\").replace('"', '\\"'),
     )
-    subprocess.run(["osascript", "-e", script], check=False)
+    subprocess.run(
+        ["osascript", "-e", script], check=False, capture_output=True
+    )
+
+
+def setup_telegram(token: str) -> int:
+    """Discover the chat ID for `token` and save the notify config."""
+    response = requests.get(
+        f"https://api.telegram.org/bot{token}/getUpdates", timeout=20
+    )
+    payload = response.json()
+    if not payload.get("ok"):
+        print(f"Token rejected by Telegram: {payload}")
+        return 1
+    chats = {}
+    for update in payload["result"]:
+        chat = update.get("message", {}).get("chat")
+        if chat:
+            chats[chat["id"]] = chat.get(
+                "username", chat.get("first_name", "?")
+            )
+    if not chats:
+        print("No messages found — open Telegram, send your bot any "
+              "message, then rerun this command.")
+        return 1
+    chat_id, username = list(chats.items())[-1]
+    config = load_notify_config()
+    config.update(telegram_token=token, telegram_chat_id=chat_id)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    path = STATE_DIR / "notify.json"
+    path.write_text(json.dumps(config, indent=1))
+    path.chmod(0o600)
+    send_telegram(config, "FPL watcher connected — alerts will "
+                          "arrive here.")
+    print(f"Saved {path} for chat {chat_id} (@{username}) and sent a "
+          f"test message.")
+    return 0
 
 
 def load_state(path: Path) -> Dict:
@@ -122,7 +216,14 @@ def generate_plan(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="FPL squad watcher")
-    parser.add_argument("team_id", type=int, help="your FPL team ID")
+    parser.add_argument(
+        "team_id", type=int, nargs="?", help="your FPL team ID"
+    )
+    parser.add_argument(
+        "--setup-telegram", metavar="BOT_TOKEN",
+        help="save Telegram credentials to ~/.phutabol/notify.json "
+             "(message your bot first) and exit",
+    )
     parser.add_argument(
         "--hours-before", type=float, default=24.0,
         help="produce the deadline plan this many hours ahead",
@@ -136,6 +237,11 @@ def main() -> int:
         help="print alerts instead of sending macOS notifications",
     )
     args = parser.parse_args()
+
+    if args.setup_telegram:
+        return setup_telegram(args.setup_telegram)
+    if args.team_id is None:
+        parser.error("team_id is required")
 
     client = FPLClient()
     bootstrap = client.get_bootstrap()
@@ -170,6 +276,7 @@ def main() -> int:
             f"FPL — GW{event['id']} plan {verb}",
             f"Deadline in {hours_left:.0f}h. Plan: {plan_path}",
             enabled=not args.no_notify,
+            body=plan_path.read_text(),
         )
         state["planned_event"] = event["id"]
     elif changes:
