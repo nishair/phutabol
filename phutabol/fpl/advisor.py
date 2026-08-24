@@ -61,6 +61,10 @@ class Advice:
     vice: Optional[ProjectedPlayer] = None
     chip: Optional[str] = None
     chip_reason: str = ""
+    # Wildcard/free hit only: who leaves and who arrives in the rebuilt
+    # squad (starters/bench then show the rebuilt 15, not the current).
+    chip_out: List[str] = field(default_factory=list)
+    chip_in: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
 
 
@@ -273,7 +277,9 @@ class Advisor:
 
     def _chip_advice(
         self, state: TeamState, squad_ids: List[int], weekly, horizon
-    ) -> Tuple[Optional[str], str]:
+    ) -> Tuple[Optional[str], str, Optional[List[int]]]:
+        """Chip to play (or None), the reason, and — for wildcard/free
+        hit — the rebuilt squad the recommendation is based on."""
         config = self.config
         n_events = len(self.bootstrap["events"])
         half = n_events // 2
@@ -307,21 +313,23 @@ class Advisor:
             event > half and wildcards_played < 2
         )
         if wildcard_ok and event > 1:
-            gain = (xi_points(horizon, rebuild(horizon))
+            rebuilt = rebuild(horizon)
+            gain = (xi_points(horizon, rebuilt)
                     - xi_points(horizon, squad_ids))
             if gain > config.wildcard_gain:
                 return "wildcard", (
                     f"a rebuilt squad projects +{gain:.0f} pts over the "
                     f"next {HORIZON} GWs"
-                )
+                ), rebuilt
 
         if "freehit" not in state.chips_used and event > 1:
-            gain = (xi_points(weekly, rebuild(weekly))
+            rebuilt = rebuild(weekly)
+            gain = (xi_points(weekly, rebuilt)
                     - xi_points(weekly, squad_ids))
             if gain > config.free_hit_gain:
                 return "freehit", (
                     f"a one-week squad projects +{gain:.0f} pts this GW"
-                )
+                ), rebuilt
 
         squad = [self.players[pid] for pid in squad_ids]
         starters, bench = pick_weekly_xi(squad, weekly)
@@ -331,12 +339,12 @@ class Advisor:
         if "bboost" not in state.chips_used and (
             bench_pts > config.bench_boost_min or event == n_events
         ):
-            return "bboost", f"bench projects {bench_pts:.1f} pts"
+            return "bboost", f"bench projects {bench_pts:.1f} pts", None
         if "3xc" not in state.chips_used and (
             captain_pts > config.triple_captain_min or event == n_events
         ):
-            return "3xc", f"captain projects {captain_pts:.1f} pts"
-        return None, ""
+            return "3xc", f"captain projects {captain_pts:.1f} pts", None
+        return None, "", None
 
     def advise(self, state: TeamState) -> Advice:
         event = self.next_event["id"]
@@ -346,13 +354,29 @@ class Advisor:
             event=event, deadline=self.next_event["deadline_time"]
         )
 
-        chip, reason = self._chip_advice(
+        chip, reason, rebuilt = self._chip_advice(
             state, state.squad_ids, weekly, horizon
         )
         advice.chip, advice.chip_reason = chip, reason
 
         squad_ids = list(state.squad_ids)
-        if chip in (None, "bboost", "3xc"):
+        if rebuilt is not None:
+            kept = set(state.squad_ids) & set(rebuilt)
+
+            def by_position(pid):
+                player = self.players[pid]
+                return player.position, -player.cost
+
+            advice.chip_out = [
+                self.players[pid].name
+                for pid in sorted(set(state.squad_ids) - kept, key=by_position)
+            ]
+            advice.chip_in = [
+                self.players[pid].name
+                for pid in sorted(set(rebuilt) - kept, key=by_position)
+            ]
+            squad_ids = list(rebuilt)
+        elif chip in (None, "bboost", "3xc"):
             swaps = self._best_swaps(
                 state, horizon, limit=max(state.free_transfers, 2)
             )
