@@ -357,3 +357,20 @@ MIT License - see LICENSE file for details.
 ---
 
 Made with ⚽ for soccer analytics enthusiasts
+## Fantasy Premier League Toolkit
+
+The `phutabol.fpl` package picks and manages an FPL team using the
+official (keyless) FPL API, with an MILP squad optimizer and projections
+backtested over eight seasons:
+
+```bash
+python fpl_pick_team.py                  # optimal GW1 squad from live data
+python fpl_manage.py <TEAM_ID>           # weekly deadline advisor for your team
+python fpl_backtest.py [--season 2025-26]  # replay a season (static + managed)
+python fpl_tune.py                       # multi-season config sweeps
+```
+
+`fpl_manage.py` reads your real squad from the public API (your team ID
+is in the site URL), then recommends transfers, XI, captain, and chip
+for the next deadline. The model handles the stats — you hold the veto
+on late team news.
