@@ -3,6 +3,8 @@ wildcard rebuild, on a hand-wired Advisor."""
 
 from collections import Counter
 
+import pytest
+
 from phutabol.fpl.advisor import Advisor, TeamState, estimate_free_transfers
 from phutabol.fpl.season import ManagerConfig
 
@@ -120,3 +122,111 @@ def test_bench_boost_advice_keeps_current_squad(player_pool):
     assert advice.chip == "bboost"
     assert advice.chip_out == [] and advice.chip_in == []
     assert {p.id for p in advice.starters + advice.bench} == set(WORST_15)
+
+
+# --- confidence gate ---------------------------------------------------
+#
+# The conftest pool leaves ProjectedPlayer.reliability at its 1.0
+# default, so these tests dial it down explicitly to model an early
+# season, where projected_ppg is mostly the positional prior.
+
+def with_reliability(pool, value):
+    from copy import copy
+    out = []
+    for player in pool:
+        clone = copy(player)
+        clone.reliability = value
+        out.append(clone)
+    return out
+
+
+def test_squad_confidence_averages_reliability(player_pool):
+    advisor = make_advisor(with_reliability(player_pool, 0.4))
+    assert advisor.squad_confidence(WORST_15) == pytest.approx(0.4)
+
+
+def test_squad_confidence_ignores_unknown_ids(player_pool):
+    advisor = make_advisor(with_reliability(player_pool, 0.5))
+    assert advisor.squad_confidence(
+        WORST_15 + [99999]
+    ) == pytest.approx(0.5)
+
+
+def test_low_confidence_suppresses_wildcard(player_pool):
+    """The same squad that fires a wildcard at full reliability must
+    not fire one when the projections are still mostly prior."""
+    state = worst_squad_state(player_pool)
+
+    confident = make_advisor(
+        with_reliability(player_pool, 1.0), wildcard_gain=0.5
+    )
+    assert confident.advise(state).chip == "wildcard"
+
+    early = make_advisor(
+        with_reliability(player_pool, 0.07), wildcard_gain=0.5
+    )
+    advice = early.advise(state)
+    assert advice.chip is None
+    assert "confidence" in advice.chip_note
+    assert advice.confidence == pytest.approx(0.07)
+
+
+def test_confidence_gate_threshold_is_configurable(player_pool):
+    state = worst_squad_state(player_pool)
+    pool = with_reliability(player_pool, 0.05)
+    # 0.05 clears a 0.01 floor but not the 0.10 default.
+    assert make_advisor(
+        pool, wildcard_gain=0.5, chip_confidence_min=0.01
+    ).advise(state).chip == "wildcard"
+    assert make_advisor(
+        pool, wildcard_gain=0.5
+    ).advise(state).chip is None
+
+
+def test_gate_does_not_block_mandatory_picks(player_pool):
+    """XI, captain and bench are compulsory every week, so the gate
+    must leave them alone -- there is no option to abstain."""
+    advisor = make_advisor(with_reliability(player_pool, 0.01))
+    advice = advisor.advise(worst_squad_state(player_pool))
+    assert len(advice.starters) == 11
+    assert len(advice.bench) == 4
+    assert advice.captain is not None
+    assert advice.vice is not None
+
+
+def test_low_confidence_raises_the_transfer_bar(player_pool):
+    """Transfers are not blocked outright, only made more expensive:
+    the same swap that passes at full reliability is declined when the
+    projections behind it are noise."""
+    state = worst_squad_state(player_pool)
+    kwargs = dict(wildcard_gain=1e9, free_hit_gain=1e9, ft_gain=4.0)
+
+    confident = make_advisor(
+        with_reliability(player_pool, 1.0), **kwargs
+    ).advise(state)
+    early = make_advisor(
+        with_reliability(player_pool, 0.07), **kwargs
+    ).advise(state)
+    assert len(early.transfers) <= len(confident.transfers)
+
+
+def test_transfer_penalty_can_be_disabled(player_pool):
+    """confidence_penalty=0 restores the pre-gate transfer behaviour."""
+    state = worst_squad_state(player_pool)
+    kwargs = dict(wildcard_gain=1e9, free_hit_gain=1e9, ft_gain=4.0)
+    baseline = make_advisor(
+        with_reliability(player_pool, 1.0), **kwargs
+    ).advise(state)
+    unpenalised = make_advisor(
+        with_reliability(player_pool, 0.07),
+        confidence_penalty=0.0, **kwargs
+    ).advise(state)
+    assert len(unpenalised.transfers) == len(baseline.transfers)
+
+
+def test_no_chip_note_when_confident(player_pool):
+    advisor = make_advisor(
+        with_reliability(player_pool, 1.0), wildcard_gain=1e9,
+        free_hit_gain=1e9,
+    )
+    assert advisor.advise(worst_squad_state(player_pool)).chip_note == ""

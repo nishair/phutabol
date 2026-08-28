@@ -66,6 +66,11 @@ class Advice:
     chip_out: List[str] = field(default_factory=list)
     chip_in: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
+    # Mean projection reliability across the squad, and -- when the
+    # confidence gate is what suppressed a chip -- why. Kept separate
+    # from `notes`, which carries player news.
+    confidence: float = 1.0
+    chip_note: str = ""
 
 
 def estimate_free_transfers(
@@ -275,6 +280,20 @@ class Advisor:
             swaps.append(best)
         return swaps
 
+    def squad_confidence(self, squad_ids: List[int]) -> float:
+        """Mean projection reliability across a squad, in [0, 1].
+
+        Low means projected_ppg is mostly the positional prior, so
+        differences between players -- and therefore any gain computed
+        from them -- are not yet distinguishable from noise.
+        """
+        values = [
+            self.players[pid].reliability
+            for pid in squad_ids
+            if pid in self.players
+        ]
+        return sum(values) / len(values) if values else 0.0
+
     def _chip_advice(
         self, state: TeamState, squad_ids: List[int], weekly, horizon
     ) -> Tuple[Optional[str], str, Optional[List[int]]]:
@@ -308,11 +327,14 @@ class Advisor:
             )
             return [p.id for p in squad.players]
 
+        confidence = self.squad_confidence(squad_ids)
+        confident = confidence >= config.chip_confidence_min
+
         wildcards_played = state.chips_used["wildcard"]
         wildcard_ok = wildcards_played == 0 or (
             event > half and wildcards_played < 2
         )
-        if wildcard_ok and event > 1:
+        if wildcard_ok and confident and event > 1:
             rebuilt = rebuild(horizon)
             gain = (xi_points(horizon, rebuilt)
                     - xi_points(horizon, squad_ids))
@@ -322,7 +344,7 @@ class Advisor:
                     f"next {HORIZON} GWs"
                 ), rebuilt
 
-        if "freehit" not in state.chips_used and event > 1:
+        if "freehit" not in state.chips_used and confident and event > 1:
             rebuilt = rebuild(weekly)
             gain = (xi_points(weekly, rebuilt)
                     - xi_points(weekly, squad_ids))
@@ -337,11 +359,13 @@ class Advisor:
         captain_pts = max(weekly.get(p.id, 0.0) for p in starters)
 
         if "bboost" not in state.chips_used and (
-            bench_pts > config.bench_boost_min or event == n_events
+            (bench_pts > config.bench_boost_min and confident)
+            or event == n_events
         ):
             return "bboost", f"bench projects {bench_pts:.1f} pts", None
         if "3xc" not in state.chips_used and (
-            captain_pts > config.triple_captain_min or event == n_events
+            (captain_pts > config.triple_captain_min and confident)
+            or event == n_events
         ):
             return "3xc", f"captain projects {captain_pts:.1f} pts", None
         return None, "", None
@@ -358,6 +382,20 @@ class Advisor:
             state, state.squad_ids, weekly, horizon
         )
         advice.chip, advice.chip_reason = chip, reason
+
+        # Say so when the gate is what is holding chips back, rather
+        # than leaving the absence of a recommendation unexplained.
+        advice.confidence = self.squad_confidence(state.squad_ids)
+        if chip is None and (
+            advice.confidence < self.config.chip_confidence_min
+        ):
+            advice.chip_note = (
+                "chips withheld — projection confidence {:.2f} is below "
+                "{:.2f}; too little of the season has been played for a "
+                "rebuild to be distinguishable from noise".format(
+                    advice.confidence, self.config.chip_confidence_min
+                )
+            )
 
         squad_ids = list(state.squad_ids)
         if rebuilt is not None:
@@ -381,11 +419,19 @@ class Advisor:
                 state, horizon, limit=max(state.free_transfers, 2)
             )
             config = self.config
+            # Transfers stay available when confidence is low -- an
+            # injury still has to be answered -- but the bar rises, so
+            # only moves that clear the noise get made.
+            inflation = 1 + config.confidence_penalty * (
+                1 - self.squad_confidence(state.squad_ids)
+            )
+            ft_gain = config.ft_gain * inflation
+            hit_gain = config.hit_gain * inflation
             for i, (gain, out_id, in_id) in enumerate(swaps):
                 if i < state.free_transfers:
-                    if gain <= config.ft_gain:
+                    if gain <= ft_gain:
                         break
-                elif gain <= config.hit_gain or advice.hit_cost >= 4 * (
+                elif gain <= hit_gain or advice.hit_cost >= 4 * (
                     config.max_hits_per_week
                 ):
                     break

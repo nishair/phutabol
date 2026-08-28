@@ -67,6 +67,21 @@ class ManagerConfig:
     free_hit_gain: float = 12.0  # single-week XI gain to fire free hit
     # A cheap bench projects ~9-10 in a normal week, so demand clearly
     # more (in practice: a double gameweek) before boosting.
+    # Confidence gate. Projections shrink toward a positional prior
+    # until a player has minutes, so early in a season every gain is
+    # mostly noise -- and the thresholds above were tuned on mature
+    # projections. Chips are irreversible, so refuse them outright
+    # below chip_confidence_min; transfers are cheap and sometimes
+    # forced (injuries), so inflate their threshold instead of
+    # blocking. Mandatory picks (XI, captain, bench order) are never
+    # gated: there is no option to abstain.
+    # 0.10 ~= one full gameweek of minutes. Swept over 8 seasons: 0.05
+    # and 0.10 gain ~+17/+20 pts/season with small downside, while 0.15
+    # and above lose points badly (-347 in 2024-25) by blocking early
+    # wildcards that paid off. The gate is meant to veto the opening
+    # gameweeks only, not to enforce patience.
+    chip_confidence_min: float = 0.10
+    confidence_penalty: float = 1.0  # transfer threshold inflation
     bench_boost_min: float = 14.0  # projected bench points to boost
     triple_captain_min: float = 11.0  # projected captain points to triple
     # Learning rates: current-season minutes at which the pre-season
@@ -237,6 +252,21 @@ class SeasonManager:
         current = self._current_ppg(pid, gw)
         return weight * self.preseason_ppg[pid] + (1 - weight) * current
 
+    def squad_confidence(self) -> float:
+        """Mean evidence weight behind the squad's projections, [0, 1].
+
+        The complement of the prior weight in `_blended_ppg`: near 0
+        early in a season, when projections are mostly pre-season prior
+        and any computed gain is indistinguishable from noise.
+        """
+        blend = self.config.blend_minutes
+        if not self.squad_ids:
+            return 0.0
+        return sum(
+            self.minutes_played[pid] / (blend + self.minutes_played[pid])
+            for pid in self.squad_ids
+        ) / len(self.squad_ids)
+
     def _crowd_factor(self, gw: int, pid: int) -> float:
         """Deadline transfer momentum as an availability/news proxy."""
         weight = self.config.crowd_weight
@@ -323,14 +353,19 @@ class SeasonManager:
 
     def _make_transfers(self, gw: int, horizon, result: WeekResult) -> None:
         config = self.config
+        inflation = 1 + config.confidence_penalty * (
+            1 - self.squad_confidence()
+        )
+        ft_gain = config.ft_gain * inflation
+        hit_gain = config.hit_gain * inflation
         while True:
             swap = self._best_swap(gw, horizon)
             if swap is None:
                 break
             gain, out_id, in_id = swap
-            if self.free_transfers > 0 and gain > config.ft_gain:
+            if self.free_transfers > 0 and gain > ft_gain:
                 self.free_transfers -= 1
-            elif (gain > config.hit_gain
+            elif (gain > hit_gain
                     and result.hits < config.max_hits_per_week):
                 result.hits += 1
             else:
@@ -395,10 +430,11 @@ class SeasonManager:
         config = self.config
         half = self.data.n_events // 2
         last = gw == self.data.n_events
+        confident = self.squad_confidence() >= config.chip_confidence_min
 
         # Wildcard: fire when a rebuilt squad clearly out-projects ours.
         wildcard = "WC1" if gw <= half else "WC2"
-        if wildcard in self.chips and gw > 1:
+        if wildcard in self.chips and confident and gw > 1:
             budget = self._squad_sale_value(gw) + self.bank
             rebuilt = self._rebuild_squad(gw, horizon, budget)
             gain = (self._projected_xi_points(horizon, rebuilt)
@@ -413,7 +449,7 @@ class SeasonManager:
                 return wildcard
 
         # Free hit: one-week rebuild, typically on a blank gameweek.
-        if "FH" in self.chips and gw > 1:
+        if "FH" in self.chips and confident and gw > 1:
             budget = self._squad_sale_value(gw) + self.bank
             rebuilt = self._rebuild_squad(gw, weekly, budget)
             gain = (self._projected_xi_points(weekly, rebuilt)
@@ -430,12 +466,14 @@ class SeasonManager:
         captain_projection = max(weekly.get(p.id, 0.0) for p in starters)
 
         if "BB" in self.chips and (
-            bench_projection > config.bench_boost_min or last
+            (bench_projection > config.bench_boost_min and confident)
+            or last
         ):
             self.chips.discard("BB")
             return "BB"
         if "TC" in self.chips and (
-            captain_projection > config.triple_captain_min or last
+            (captain_projection > config.triple_captain_min and confident)
+            or last
         ):
             self.chips.discard("TC")
             return "TC"

@@ -81,6 +81,9 @@ def main() -> None:
             print("  (XI and bench below are the rebuilt squad)")
         print()
 
+    if advice.chip_note:
+        print(f"CHIP: {advice.chip_note}\n")
+
     if advice.transfers:
         print("TRANSFERS:")
         for out_name, in_name, gain in advice.transfers:
