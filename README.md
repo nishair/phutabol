@@ -370,6 +370,17 @@ python fpl_backtest.py [--season 2025-26]  # replay a season (static + managed)
 python fpl_tune.py                       # multi-season config sweeps
 ```
 
+Projections shrink toward a positional prior until players have
+minutes, so early in a season the gaps between them are mostly noise.
+A confidence gate keeps that noise from triggering irreversible moves:
+chips are withheld while mean projection reliability is under
+`chip_confidence_min` (0.10, about one full gameweek), and transfer
+thresholds are inflated rather than blocked, so an injury can still be
+answered. Mandatory picks — XI, captain, bench order — are never gated,
+since there is no option to abstain. Worth +31 pts/season across eight
+backtested seasons; set `confidence_penalty=0` and
+`chip_confidence_min=0` to restore the old behaviour.
+
 `fpl_manage.py` reads your real squad from the public API (your team ID
 is in the site URL), then recommends transfers, XI, captain, and chip
 for the next deadline. When it recommends a wildcard or free hit it

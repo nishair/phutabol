@@ -59,6 +59,13 @@ class ProjectedPlayer:
     # factor over the build horizon.
     base_ppg: float = 0.0
     availability: float = 1.0
+    # Weight this player's own scoring rate carries against the
+    # positional prior: minutes / (minutes + SHRINKAGE_MINUTES). Near 0
+    # early in a season, meaning projected_ppg is mostly prior and the
+    # differences between players are not yet real. Callers deciding
+    # whether to *act* should consult this; see ManagerConfig's
+    # confidence gate.
+    reliability: float = 1.0
 
     @property
     def position_name(self) -> str:
@@ -198,6 +205,7 @@ def build_projections(
                 last_season_points=element["total_points"],
                 last_season_ppg=last_ppg,
                 minutes=minutes,
+                reliability=round(reliability, 4),
                 selected_by_percent=float(element["selected_by_percent"]),
                 status=element["status"],
                 news=element.get("news", ""),
